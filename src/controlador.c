@@ -20,7 +20,7 @@ extern int tempo_simulado;              // tempo simulado atual
 extern char **environ;                  // usado no execve do veiculo, para aceder e passar as Variáveis de Ambiente do sistema operativo.
 volatile sig_atomic_t running_ctrl = 1; // Controlador a correr
 
-// Prototipos internos
+// Prototipos internos so pertencentes ao controlador
 static void cria_servico_teste(void) __attribute__((unused));           // só para demo
 static void processa_mensagem_veiculo(int id_servico, const char *msg); // processa msg veiculo
 static void spawn_veiculo_para_servico(Servico *s);                     // lança veiculo

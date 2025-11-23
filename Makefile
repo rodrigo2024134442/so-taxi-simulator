@@ -3,8 +3,8 @@ CFLAGS=-Wall -Wextra -O2 -std=c17 -Iinclude -pthread
 
 all: controlador cliente veiculo
 
-controlador: src/controlador.c src/modelo.c
-	$(CC) $(CFLAGS) -o controlador src/controlador.c src/modelo.c
+controlador: src/controlador.c src/frota.c
+	$(CC) $(CFLAGS) -o controlador src/controlador.c src/frota.c
 
 cliente: src/cliente.c
 	$(CC) $(CFLAGS) -o cliente src/cliente.c

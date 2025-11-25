@@ -9,6 +9,7 @@
 #define MAX_USERS     30
 #define MAX_SERVICOS  100
 #define MAX_VEICULOS  10
+#define MAX_FILA_ESPERA 100
 
 // ===== UTILIZADORES =====
 typedef enum {
@@ -19,12 +20,23 @@ typedef enum {
 typedef struct {
     char nome[32];
     char fifo_cli[128];   // FIFO controlador->cliente
-    pid_t pid_cliente;  // PID do processo cliente    
+    pid_t pid_cliente;    // PID do processo cliente    
     EstadoUser estado;
     int ativo;            // 0/1
 } Utilizador;
 
 // ===== SERVIÇOS =====
+// definir tipo FilaEspera antes de usar
+typedef struct {
+    int id_servico;
+    int tempo_agendado;  // Quando foi agendado
+} FilaEspera;
+
+// declarar a fila e índices como externes (definir em .c)
+extern FilaEspera fila_espera[MAX_FILA_ESPERA];
+extern int fila_head;  // Próximo a processar
+extern int fila_count; // Quantos estão na fila
+
 typedef enum {
     S_AGENDADO,
     S_EM_CURSO,
@@ -41,6 +53,7 @@ typedef struct {
     EstadoServico estado;
     pid_t pid_veiculo;    // -1 se ainda não lançado
     int   perc_concl;     // 0..100
+    int   na_fila;        // 0/1 - indica se já entrou na fila de espera
 } Servico;
 
 // ===== VEÍCULOS (processos em execução) =====
@@ -66,6 +79,5 @@ extern int max_veiculos_ativos;
 extern int km_total; 
 
 extern int em_encerramento;
-
 
 #endif

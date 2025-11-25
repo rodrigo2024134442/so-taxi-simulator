@@ -180,6 +180,7 @@ static void cria_servico_teste(void)
     s->estado = S_AGENDADO;
     s->pid_veiculo = -1;
     s->perc_concl = 0;
+    s->na_fila = 0; // inicializar flag
 
     // Serviço 2
     Servico *t = &servicos[1];
@@ -191,6 +192,7 @@ static void cria_servico_teste(void)
     t->estado = S_AGENDADO;
     t->pid_veiculo = -1;
     t->perc_concl = 0;
+    t->na_fila = 0;
 
     n_servicos = 2;
 }
@@ -325,14 +327,18 @@ static void spawn_veiculo_para_servico(Servico *s)
         _exit(1);
     }
 
-    // PAI (controlador)
     close(p[1]); // só vamos ler
 
     int idx = encontra_slot_livre_veiculo();
     if (idx < 0)
     {
-        // não há slot livre -> fecha pipe e (idealmente) mata o veiculo
+        kill(pid, SIGTERM);
         close(p[0]);
+        
+        // ✅ NOTIFICAR CLIENTE
+        // (Opcional, ou marcar serviço para retry)
+        printf("[CTRL] ERRO: Sem slots para servico id=%d (PID filho: %d terminado).\n",
+               s->id, pid);
         return;
     }
 
@@ -476,6 +482,7 @@ static void tratar_pedido_agendar(const Pedido *p)
         s->estado = S_AGENDADO;
         s->pid_veiculo = -1;
         s->perc_concl = 0;
+        s->na_fila = 0; // flag seta ou nao na fila de espera
 
         n_servicos++;
 
@@ -693,7 +700,7 @@ static void *thread_telemetria(void *arg)
 // ----------------------------------------------------------------------
 static void *thread_relogio(void *arg)
 {
-    (void)arg; // evita warning
+    (void)arg;
 
     while (running_ctrl)
     {
@@ -701,19 +708,71 @@ static void *thread_relogio(void *arg)
         tempo_simulado++;
 
         pthread_mutex_lock(&mux_servicos);
-        // varre os serviços à espera
+
+        // 1️ ADICIONAR SERVIÇOS À FILA quando a hora chega
         for (int i = 0; i < n_servicos; i++)
         {
             Servico *s = &servicos[i];
 
             if (s->estado == S_AGENDADO &&
-                s->hora == tempo_simulado)
+                s->hora <= tempo_simulado &&
+                s->na_fila == 0)  // ainda não na fila
             {
-                printf("[RELOGIO] hora=%d, lançar servico id=%d\n",
-                       tempo_simulado, s->id);
-                spawn_veiculo_para_servico(s);
+                // Se houver slot livre, lançar já; caso contrário, entrar na fila
+                if (encontra_slot_livre_veiculo() >= 0)
+                {
+                    printf("[RELOGIO] hora=%d, lançar servico id=%d (slot disponível)\n",
+                           tempo_simulado, s->id);
+                    spawn_veiculo_para_servico(s);
+                }
+                else
+                {
+                    // Entrar na fila de espera (só se não houver slot)
+                    if (fila_count < MAX_FILA_ESPERA)
+                    {
+                        // ← CORREÇÃO: usar buffer circular
+                        int pos = (fila_head + fila_count) % MAX_FILA_ESPERA;
+                        fila_espera[pos].id_servico = s->id;
+                        fila_espera[pos].tempo_agendado = s->hora;
+                        fila_count++;
+                        s->na_fila = 1;
+                        printf("[RELOGIO] Sem slots: Servico %d entrou na fila de espera (posicao: %d)\n",
+                               s->id, fila_count);
+                    }
+                    else
+                    {
+                        // fila cheia: log e manter S_AGENDADO
+                        printf("[RELOGIO] Fila de espera cheia. Servico %d nao pode ser enfileirado.\n", s->id);
+                    }
+                }
             }
         }
+
+        // 2️ PROCESSAR FILA (LIFO - Last In, First Out)
+        while (fila_count > 0 && encontra_slot_livre_veiculo() >= 0)
+        {
+            // Índice do último elemento inserido (tail)
+            int tail = fila_head + fila_count - 1;
+            if (tail >= MAX_FILA_ESPERA)
+                tail -= MAX_FILA_ESPERA;
+
+            int id_servico = fila_espera[tail].id_servico;
+            Servico *s = &servicos[id_servico - 1];
+
+            printf("[RELOGIO] Processando (LIFO) servico %d da fila\n", id_servico);
+
+            // Marca que sai da fila antes de spawn (evita duplicados)
+            s->na_fila = 0;
+
+            spawn_veiculo_para_servico(s);
+
+            // Remover do topo da pilha (LIFO)
+            fila_count--;
+            if (fila_count == 0)
+                fila_head = 0; // reset para simplificar
+            // fila_head inalterado para LIFO
+        }
+
         pthread_mutex_unlock(&mux_servicos);
     }
 

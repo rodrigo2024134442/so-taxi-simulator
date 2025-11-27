@@ -11,7 +11,8 @@ typedef enum
     CMD_AGENDAR = 2,   // pedido de agendamento de serviço
     CMD_ENTRAR = 3,    // informar que vai entrar no veiculo
     CMD_CONSULTAR = 4, // consultar
-    CMD_CANCELAR = 5
+    CMD_CANCELAR = 5,
+    CMD_SAIR = 6        // ← ADICIONAR
 } TipoPedido;
 
 // Estrutura genérica de pedido (por enquanto cobre HELLO e AGENDAR)

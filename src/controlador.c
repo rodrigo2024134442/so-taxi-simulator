@@ -540,7 +540,9 @@ static void tratar_pedido_cancelar_user(const Pedido *p)
             if (s->estado == S_AGENDADO)
             {
                 s->estado = S_CANCELADO;
-                notificar_cliente(s, "Servico cancelado com sucesso.");
+                s->na_fila = 0;  // ← ADICIONAR
+                printf("Servico %d cancelado (ainda nao tinha iniciado).\n", id);
+                notificar_cliente(s, "O seu agendamento foi cancelado pelo administrador.");
             }
             else if (s->estado == S_EM_CURSO)
             {
@@ -756,8 +758,18 @@ static void *thread_relogio(void *arg)
             if (tail >= MAX_FILA_ESPERA)
                 tail -= MAX_FILA_ESPERA;
 
+            // Em thread_relogio(), antes de spawn - PROTEÇÃO
             int id_servico = fila_espera[tail].id_servico;
+            if (id_servico < 0 || id_servico > n_servicos)
+                continue; // entrada inválida
+
             Servico *s = &servicos[id_servico - 1];
+            if (s->estado == S_CANCELADO)
+            {
+                printf("[RELOGIO] Servico %d ja cancelado. Removendo da fila.\n", id_servico);
+                fila_count--;
+                continue;
+            }
 
             printf("[RELOGIO] Processando (LIFO) servico %d da fila\n", id_servico);
 
@@ -912,6 +924,10 @@ static void loop_pedidos(void)
         {
             tratar_pedido_consultar(&p);
         }
+        else if (p.tipo == CMD_SAIR)
+        {
+            tratar_pedido_sair(&p);
+        }
         else
         {
             printf("[CTRL] pedido desconhecido do tipo %d\n", p.tipo);
@@ -1003,6 +1019,7 @@ static void cmd_cancelar(int id)
     {
         // Se ainda não começou, basta mudar o estado
         s->estado = S_CANCELADO;
+        s->na_fila = 0;  // ← ADICIONAR
         printf("Servico %d cancelado (ainda nao tinha iniciado).\n", id);
         notificar_cliente(s, "O seu agendamento foi cancelado pelo administrador.");
     }
@@ -1086,4 +1103,72 @@ void handle_sigint(int sig)
 {
     (void)sig;
     running_ctrl = 0;
+}
+
+// Tratar pedido CMD_SAIR
+static void tratar_pedido_sair(Pedido *p)
+{
+    pthread_mutex_lock(&mux_servicos);
+
+    // Procurar se o utilizador tem um serviço ativo (EM_CURSO)
+    int tem_servico_ativo = 0;
+    int id_servico_ativo = -1;
+    
+    for (int i = 0; i < n_servicos; i++)
+    {
+        Servico *s = &servicos[i];
+        if (strcmp(s->user, p->user) == 0 && s->estado == S_EM_CURSO)
+        {
+            tem_servico_ativo = 1;
+            id_servico_ativo = s->id;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&mux_servicos);
+
+    // Enviar resposta via FIFO do cliente
+    int fd_resp = open(p->fifo_resp, O_WRONLY);
+    if (fd_resp == -1)
+    {
+        printf("[CTRL] Erro ao abrir FIFO de resposta para %s\n", p->user);
+        return;
+    }
+
+    Resposta r;
+    memset(&r, 0, sizeof(r));
+
+    if (tem_servico_ativo)
+    {
+        r.ok = 0;  //  Não pode sair
+        snprintf(r.msg, sizeof(r.msg),
+                 "[BLOQUEADO] Nao podes sair! Tens a viagem %d em curso. Aguarda a finalizacao.",
+                 id_servico_ativo);
+        printf("[CTRL] Cliente %s tem viagem ativa (ID=%d). Saida bloqueada.\n",
+               p->user, id_servico_ativo);
+    }
+    else
+    {
+        r.ok = 1;  //  Pode sair
+        snprintf(r.msg, sizeof(r.msg),
+                 "[OK] Podes sair com seguranca.");
+        
+        // Marcar utilizador como inativo
+        pthread_mutex_lock(&mux_servicos);
+        for (int i = 0; i < n_users; i++)
+        {
+            if (strcmp(users[i].nome, p->user) == 0)
+            {
+                users[i].ativo = 0;
+                printf("[CTRL] Utilizador %s marcado como inativo.\n", p->user);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&mux_servicos);
+    }
+
+    write(fd_resp, &r, sizeof(r));
+    close(fd_resp);
+
+    printf("[CTRL] Resposta CMD_SAIR enviada para %s (ok=%d)\n", p->user, r.ok);
 }

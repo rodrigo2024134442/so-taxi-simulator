@@ -20,6 +20,11 @@
 // variável global modificada pelo handler de sinais
 volatile sig_atomic_t running = 1;
 
+volatile sig_atomic_t ctrl_c_pressed = 0;
+volatile sig_atomic_t pediu_sair = 0;
+volatile sig_atomic_t pode_sair = 0;
+static int confirmar_saida_segura(ContextoCliente *ctx);
+
 static int cmd_agendar(ContextoCliente *ctx, const char *args);
 static int cmd_entrar(ContextoCliente *ctx, const char *args);
 static int cmd_cancelar_pedido(ContextoCliente *ctx, const char *args);
@@ -108,9 +113,6 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
     ctx.user = user;
     ctx.fifo_resp = fifo_resp_path;
 
-    // 1. Abrir o FIFO de resposta e MANTER ABERTO
-    // Usamos O_RDWR para evitar receber EOF imediato se ninguem estiver a escrever
-    // (Isto é um truque comum em FIFOs para "manter a linha aberta")
     int fd_resp = open(fifo_resp_path, O_RDWR);
     if (fd_resp == -1)
     {
@@ -122,19 +124,29 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
 
     while (running)
     {
-        fd_set readfds;                 // conjunto de descritores para ler
-        FD_ZERO(&readfds);              // limpar conjunto
-        FD_SET(STDIN_FILENO, &readfds); // adicionar stdin ao conjunto
-        FD_SET(fd_resp, &readfds);      // adicionar FIFO de resposta ao conjunto
+        //  VERIFICAR SE CTRL+C FOI PREMIDO
+        if (ctrl_c_pressed)
+        {
+            if (confirmar_saida_segura(&ctx))
+            {
+                break;  // Sair do loop
+            }
+            ctrl_c_pressed = 0;  // Reset
+        }
 
-        // O select fica bloqueado aqui até ALGUÉM falar
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+        FD_SET(fd_resp, &readfds);
+
         int maxfd = (STDIN_FILENO > fd_resp) ? STDIN_FILENO : fd_resp;
 
-        // MULTIPLEXAGEM DE I/O (SELECT)
-        // Usamos select() para vigiar simultaneamente o teclado (stdin) e o FIFO.
-        // Isto evita que o cliente bloqueie à espera de input do utilizador
-        // e permite mostrar mensagens do servidor em tempo real.
-        int atividade = select(maxfd + 1, &readfds, NULL, NULL, NULL);
+        //  SELECT COM TIMEOUT PARA PERMITIR VERIFICAR ctrl_c_pressed
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        int atividade = select(maxfd + 1, &readfds, NULL, NULL, &tv);
 
         if ((atividade < 0) && (errno != EINTR))
         {
@@ -142,49 +154,50 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
             break;
         }
 
-        // === CASO 1: MENSAGEM DO CONTROLADOR (Veículo chegou, etc) === //
+        // === CASO 1: MENSAGEM DO CONTROLADOR === //
         if (FD_ISSET(fd_resp, &readfds))
         {
             Resposta r;
             ssize_t n = read(fd_resp, &r, sizeof(r));
             if (n == sizeof(r))
             {
-                // Limpar a linha atual (cosmética) e imprimir a mensagem
-                printf("\n[AVISO] %s\ncomando> ", r.msg);
+                printf("\n[AVISO] %s\n", r.msg);
+
+                // SE CLIENTE PEDIU SAIR E RECEBE RESPOSTA
+                if (pediu_sair)
+                {
+                    pode_sair = r.ok;  // 1 = pode sair, 0 = não pode
+                }
+
+                printf("comando> ");
                 fflush(stdout);
             }
         }
+
         // === CASO 2: O UTILIZADOR ESCREVEU NO TECLADO === //
         if (FD_ISSET(STDIN_FILENO, &readfds))
         {
             if (!fgets(linha, sizeof(linha), stdin))
             {
-                break; // EOF
+                break;
             }
 
-            // Remover o \n final
             linha[strcspn(linha, "\n")] = '\0';
 
             if (linha[0] == '\0')
             {
                 printf("comando> ");
                 fflush(stdout);
-                continue; // linha vazia, pedir outro comando e
+                continue;
             }
 
-            // Limpar buffers antes de ler
             memset(comando, 0, sizeof(comando));
             memset(args, 0, sizeof(args));
 
-            // Tenta separar: comando + argumentos
-            // %31s lê a primeira palavra
-            // %223[^\n] lê o resto da linha até ao fim
-            // int n =
-            sscanf(linha, "%31s %223[^\n]", comando, args);
+            int n = sscanf(linha, "%31s %223[^\n]", comando, args);
+            if (n < 1)
+                continue;
 
-            /* if (n < 1)
-                continue; // Linha vazia ou erro
- */
             // Executar comandos
             // NOTA: Como o FIFO já está aberto aqui (fd_resp),
             // as funções cmd_* NÃO devem tentar abrir o FIFO de leitura novamente
@@ -215,10 +228,7 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
             }
             else if (strcmp(comando, "sair") == 0)
             {
-                if (cmd_sair(&ctx, args) == 0)
-                {
-                    break; // sair do loop
-                }
+                cmd_sair(&ctx, args);
             }
             else
             {
@@ -227,7 +237,48 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
             }
         }
     }
-    close(fd_resp); // fechar FIFO de resposta
+    close(fd_resp);
+}
+
+//Confirmar saída segura
+static int confirmar_saida_segura(ContextoCliente *ctx)
+{
+    printf("\n[AVISO] Pressione Ctrl+C novamente para confirmar saida (3 segundos).\n");
+    printf("Ou escreva um comando para continuar.\n");
+
+    // Dar 3 segundos para confirmar
+    ctrl_c_pressed = 0;
+    sleep(3);
+
+    if (ctrl_c_pressed)
+    {
+        // Utilizador premiu Ctrl+C novamente dentro de 3s
+        printf("\n[CLI] A terminar de forma segura...\n");
+        
+        // Notificar o controlador que o cliente vai sair
+        Pedido p;
+        memset(&p, 0, sizeof(p));
+        p.tipo = CMD_SAIR;
+        p.pid_cliente = getpid();
+        snprintf(p.user, sizeof(p.user), "%s", ctx->user);
+        snprintf(p.fifo_resp, sizeof(p.fifo_resp), "%s", ctx->fifo_resp);
+
+        int fd = open(FIFO_PEDIDOS, O_WRONLY);
+        if (fd != -1)
+        {
+            write(fd, &p, sizeof(p));
+            close(fd);
+        }
+
+        return 1;  // Sinal para sair
+    }
+    else
+    {
+        printf("[CLI] Saida cancelada. Continua...\n");
+        printf("comando> ");
+        fflush(stdout);
+        return 0;  // Continuar
+    }
 }
 
 static int cmd_help(ContextoCliente *ctx, const char *args)
@@ -362,12 +413,49 @@ static int cmd_consultar(ContextoCliente *ctx, const char *args)
     return 0;
 }
 
+//cmd_sair
 static int cmd_sair(ContextoCliente *ctx, const char *args)
 {
-    (void)ctx;
     (void)args;
-    printf("[CLI] A terminar aplicacao...\n");
-    return 0; // Retorna 0 para parar o loop no main (conforme o teu if)
+
+    // Enviar pedido CMD_SAIR ao controlador
+    Pedido p;
+    memset(&p, 0, sizeof(p));
+    p.tipo = CMD_SAIR;
+    p.pid_cliente = getpid();
+    snprintf(p.user, sizeof(p.user), "%s", ctx->user);
+    snprintf(p.fifo_resp, sizeof(p.fifo_resp), "%s", ctx->fifo_resp);
+
+    int fd = open(FIFO_PEDIDOS, O_WRONLY);
+    if (fd == -1)
+    {
+        perror("[CLI] Erro ao contactar controlador");
+        return -1;
+    }
+    write(fd, &p, sizeof(p));
+    close(fd);
+
+    printf("[CLI] A verificar se podes sair...\n");
+    pediu_sair = 1;
+    pode_sair = 0;
+
+    // Bloquear até ter resposta (5 segundos timeout)
+    for (int tentativas = 0; tentativas < 50; tentativas++)
+    {
+        if (pode_sair)
+        {
+            printf("[CLI] Podes sair com seguranca.\n");
+            pediu_sair = 0;
+            running = 0;  // Sinal para sair do loop
+            return 0;
+        }
+        usleep(100000);  // 100ms
+    }
+
+    printf("[CLI] Timeout na resposta do controlador ou tens viagem ativa.\n");
+    pediu_sair = 0;
+    pode_sair = 0;
+    return -1;
 }
 
 static int cmd_entrar(ContextoCliente *ctx, const char *args)
@@ -421,12 +509,17 @@ static void setup_directory(void)
     }
 }
 
+//handle_signal
 static void handle_signal(int sig, siginfo_t *info, void *context)
 {
     (void)info;
     (void)context;
-    if (sig == SIGINT || sig == SIGPIPE)
+    if (sig == SIGINT)
     {
-        running = 0;
+        ctrl_c_pressed = 1;  // ← NÃO seta running = 0 aqui
+    }
+    else if (sig == SIGPIPE)
+    {
+        // Ignorar SIGPIPE
     }
 }

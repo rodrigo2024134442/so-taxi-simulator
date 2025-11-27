@@ -535,14 +535,13 @@ static void tratar_pedido_cancelar_user(const Pedido *p)
         // VERIFICAÇÃO DE SEGURANÇA: O serviço pertence a este user?
         if (strcmp(s->user, p->user) == 0)
         {
-
             // Logica de cancelamento (semelhante ao admin)
             if (s->estado == S_AGENDADO)
             {
                 s->estado = S_CANCELADO;
-                s->na_fila = 0;  // ← ADICIONAR
-                printf("Servico %d cancelado (ainda nao tinha iniciado).\n", id);
-                notificar_cliente(s, "O seu agendamento foi cancelado pelo administrador.");
+                s->na_fila = 0;
+                printf("Servico %d cancelado (ainda nao tinha iniciado).\n", id_alvo);  // ← MUDAR 'id' para 'id_alvo'
+                notificar_cliente(s, "O seu agendamento foi cancelado.");
             }
             else if (s->estado == S_EM_CURSO)
             {
@@ -560,9 +559,6 @@ static void tratar_pedido_cancelar_user(const Pedido *p)
         else
         {
             // Tentar cancelar serviço de outro user
-            // Enviamos resposta de erro num canal temporario construído para este pedido
-            // (Ou usamos notificar_cliente se assumirmos que ele é o dono do FIFO)
-            // Simplificação: não notificamos erros de permissão ou logamos no servidor
             printf("[CTRL] User %s tentou cancelar servico %d que nao lhe pertence.\n", p->user, id_alvo);
         }
     }

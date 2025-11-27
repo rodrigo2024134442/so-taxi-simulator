@@ -20,10 +20,8 @@
 // variável global modificada pelo handler de sinais
 volatile sig_atomic_t running = 1;
 
-volatile sig_atomic_t ctrl_c_pressed = 0;
 volatile sig_atomic_t pediu_sair = 0;
 volatile sig_atomic_t pode_sair = 0;
-static int confirmar_saida_segura(ContextoCliente *ctx);
 
 static int cmd_agendar(ContextoCliente *ctx, const char *args);
 static int cmd_entrar(ContextoCliente *ctx, const char *args);
@@ -33,7 +31,6 @@ static int cmd_help(ContextoCliente *ctx, const char *args);
 static int cmd_sair(ContextoCliente *ctx, const char *args);
 static void loop_comandos(const char *user, const char *fifo_resp_path);
 static void setup_directory(void);
-static void handle_signal(int sig, siginfo_t *info, void *context);
 
 int main(int argc, char **argv)
 {
@@ -50,7 +47,6 @@ int main(int argc, char **argv)
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_flags = SA_SIGINFO;
-    sa.sa_sigaction = handle_signal;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGPIPE, &sa, NULL);
 
@@ -124,16 +120,7 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
 
     while (running)
     {
-        //  VERIFICAR SE CTRL+C FOI PREMIDO
-        if (ctrl_c_pressed)
-        {
-            if (confirmar_saida_segura(&ctx))
-            {
-                break;  // Sair do loop
-            }
-            ctrl_c_pressed = 0;  // Reset
-        }
-
+        // ignora ctrl_c_pressed aqui para permitir continuar o loop
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(STDIN_FILENO, &readfds);
@@ -238,47 +225,6 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
         }
     }
     close(fd_resp);
-}
-
-//Confirmar saída segura
-static int confirmar_saida_segura(ContextoCliente *ctx)
-{
-    printf("\n[AVISO] Pressione Ctrl+C novamente para confirmar saida (3 segundos).\n");
-    printf("Ou escreva um comando para continuar.\n");
-
-    // Dar 3 segundos para confirmar
-    ctrl_c_pressed = 0;
-    sleep(3);
-
-    if (ctrl_c_pressed)
-    {
-        // Utilizador premiu Ctrl+C novamente dentro de 3s
-        printf("\n[CLI] A terminar de forma segura...\n");
-        
-        // Notificar o controlador que o cliente vai sair
-        Pedido p;
-        memset(&p, 0, sizeof(p));
-        p.tipo = CMD_SAIR;
-        p.pid_cliente = getpid();
-        snprintf(p.user, sizeof(p.user), "%s", ctx->user);
-        snprintf(p.fifo_resp, sizeof(p.fifo_resp), "%s", ctx->fifo_resp);
-
-        int fd = open(FIFO_PEDIDOS, O_WRONLY);
-        if (fd != -1)
-        {
-            write(fd, &p, sizeof(p));
-            close(fd);
-        }
-
-        return 1;  // Sinal para sair
-    }
-    else
-    {
-        printf("[CLI] Saida cancelada. Continua...\n");
-        printf("comando> ");
-        fflush(stdout);
-        return 0;  // Continuar
-    }
 }
 
 static int cmd_help(ContextoCliente *ctx, const char *args)
@@ -506,20 +452,5 @@ static void setup_directory(void)
         {
             perror("[CLI] Erro ao criar diretório FIFO_DIR");
         }
-    }
-}
-
-//handle_signal
-static void handle_signal(int sig, siginfo_t *info, void *context)
-{
-    (void)info;
-    (void)context;
-    if (sig == SIGINT)
-    {
-        ctrl_c_pressed = 1;  // ← NÃO seta running = 0 aqui
-    }
-    else if (sig == SIGPIPE)
-    {
-        // Ignorar SIGPIPE
     }
 }

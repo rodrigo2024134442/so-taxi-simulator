@@ -10,21 +10,24 @@
 #include <errno.h>
 #include <stdint.h>
 
-#include "comunicacao.h"
+#include "taxis_protocol.h"
 #include "frota.h"
 
 #define FIFO_DIR "./tmp"
 #define FIFO_PEDIDOS FIFO_DIR "/taxi_pedidos"
 
 extern int tempo_simulado;              // tempo simulado atual
-extern char **environ;                  // usado no execve do veiculo, para aceder e passar as Variáveis de Ambiente do sistema operativo.
-volatile sig_atomic_t running_ctrl = 1; // Controlador a correr
+extern char **environ;                  // Usado no execve do veículo, para aceder e passar as variáveis de ambiente do sistema operativo.
+volatile sig_atomic_t running_ctrl = 1; // Controlador em execução
 
-// Prototipos internos so pertencentes ao controlador
+// Prototipos internos
+// Visibilidade no Ligador (Linker).
+// Usamos 'static' para limitar o escopo ao ficheiro atual (controlador.c)
+// Evita conflitos de nomes com outras partes do programa.
 static void cria_servico_teste(void) __attribute__((unused));           // só para demo
 static void processa_mensagem_veiculo(int id_servico, const char *msg); // processa msg veiculo
 static void spawn_veiculo_para_servico(Servico *s);                     // lança veiculo
-static void notificar_cliente(const Servico *s, const char *texto);     // notifica cliente
+static int notificar_cliente(const Servico *s, const char *texto);      // notifica cliente
 static int encontra_slot_livre_veiculo(void);                           // encontra slot livre em veiculos[]
 static void *thread_telemetria(void *arg);                              // Thread que lê telemetria
 static void *thread_relogio(void *arg);                                 // Thread do relógio
@@ -35,7 +38,6 @@ static void tratar_pedido_entrar(const Pedido *p);                      // trata
 static void tratar_pedido_cancelar_user(const Pedido *p);               // trata pedido CANCELAR
 static void tratar_pedido_consultar(const Pedido *p);                   // trata pedido CONSULTAR
 static void *thread_clientes(void *arg);                                // Thread de atendimento a clientes
-static int conta_servicos_ativos(void);                                 // Conta serviços em execução
 static void cmd_listar(void);                                           // Procedimento listar
 static void cmd_frota(void);                                            // Procedimento frota
 static void cmd_utiliz(void);                                           // Procedimento utiliz
@@ -68,7 +70,7 @@ int main(void)
         printf("[CTRL] NVEICULOS não definido. A usar defeito: %d\n", max_veiculos_ativos);
     }
 
-    // 1. Configuração Inicial (Diretorios, Sinais, FIFOs)
+    // 1. Configuração inicial (diretórios, sinais, FIFOs)
     if (mkdir(FIFO_DIR, 0777) == -1 && errno != EEXIST)
     {
         perror("[CTRL] erro a criar diretório FIFO_DIR");
@@ -106,7 +108,8 @@ int main(void)
     char linha[256];
     while (running_ctrl)
     {
-        // printf("admin> "); fflush(stdout); // Opcional: Prompt
+        printf("admin> ");
+        fflush(stdout); // Opcional: Prompt
 
         if (!fgets(linha, sizeof(linha), stdin))
             break;
@@ -124,7 +127,7 @@ int main(void)
         {
             cmd_utiliz();
         }
-        else if (strcmp(linha, "terminar") == 0)
+        else if (strcmp(linha, "terminar") == 0 || strcmp(linha, "sair") == 0)
         {
             cmd_terminar();
         }
@@ -134,9 +137,9 @@ int main(void)
         }
         else if (strcmp(linha, "hora") == 0)
         {
-            printf("Tempo simulado: %d ticks\n", tempo_simulado);
+            printf("Tempo simulado: %d ticks (hora %2dh)\n", tempo_simulado, tempo_simulado % 24);
         }
-        else if (strcmp(linha, "ajuda") == 0)
+        else if (strcmp(linha, "ajuda") == 0 || strcmp(linha, "?") == 0 || strcmp(linha, "help") == 0 || strcmp(linha, "h") == 0)
         {
             printf("Comandos: listar, frota, utiliz, km, hora, cancelar <id>, terminar\n");
         }
@@ -146,7 +149,6 @@ int main(void)
             // Tenta ler "cancelar 1", "cancelar 2", etc.
             if (sscanf(linha, "cancelar %d", &id_cancelar) == 1)
             {
-                // Precisas de declarar esta função nova no topo!
                 cmd_cancelar(id_cancelar);
             }
             else
@@ -214,22 +216,25 @@ static void processa_mensagem_veiculo(int id_servico, const char *msg)
     }
     // --- Lógica de Mensagens ---
 
+    // Lógica Genérica: Se não conseguirmos avisar o cliente, ABORTAMOS TUDO.
+    int cliente_vivo = 1;
+
     // 1. CHEGADA (Veículo -> Controlador -> Cliente)
     // 1. O veículo avisa que chegou
     if (strncmp(msg, "VEICULO", 7) == 0)
     {
         // Vamos avisar o cliente!
-        printf("[CTRL] Veiculo chegou ao cliente %s (Servico %d)\n", s->user, s->id);
-        notificar_cliente(s, "O seu Taxi chegou! Escreva 'entrar'.");
+        printf("[CTRL] Veículo chegou ao cliente %s (Serviço %d)\n", s->user, s->id);
+        cliente_vivo = notificar_cliente(s, "O seu táxi chegou! Escreva 'entrar'.");
     }
-    // 2. INICIO DA VIAGEM (quando recebe SIGUSR1 e arranca)
+    // 2. Início da viagem (quando recebe SIGUSR1 e arranca)
     else if (strncmp(msg, "INICIO", 6) == 0)
     {
         s->estado = S_EM_CURSO;
         s->perc_concl = 0;
         printf("[CTRL] Servico %d iniciou viagem.\n", s->id);
         // Avisar cliente que arrancou
-        notificar_cliente(s, "Viagem iniciada!");
+        cliente_vivo = notificar_cliente(s, "Viagem iniciada!");
     }
     // 3. PROGRESSO (PERC)
     else if (strncmp(msg, "PERC ", 5) == 0)
@@ -239,7 +244,7 @@ static void processa_mensagem_veiculo(int id_servico, const char *msg)
         // Criar mensagem para o cliente: "Viagem: 10%..."
         char msg_cli[64];
         snprintf(msg_cli, sizeof(msg_cli), "Viagem em curso: %d%%", perc);
-        notificar_cliente(s, msg_cli);
+        cliente_vivo = notificar_cliente(s, msg_cli);
     }
     // 4. Fim da viagem
     else if (strncmp(msg, "FIM", 3) == 0)
@@ -249,16 +254,28 @@ static void processa_mensagem_veiculo(int id_servico, const char *msg)
         // === CONTABILIZAR QUILÓMETROS ===
         km_total += s->dist_km; // <--- AQUI está a resposta aos KMs
 
-        printf("[CTRL] Servico %d concluido. Total frota: %d Km.\n", s->id, km_total);
+        printf("[CTRL] Serviço %d concluído. Total frota: %d Km.\n", s->id, km_total);
         // Avisar cliente que a viagem terminou
         char msg_cli[128];
-        snprintf(msg_cli, sizeof(msg_cli), "Viagem terminada! Total: %d Km. Obrigado.", s->dist_km);
+        snprintf(msg_cli, sizeof(msg_cli), "Viagem terminada! Total: %d km. Obrigado.", s->dist_km);
         notificar_cliente(s, msg_cli);
+        // No fim não interessa se o cliente está vivo ou não, o serviço acabou.
     }
+    // !=== CLIENTE DESAPARECEU === //
+    // *Se o cliente não estiver a receber mensagens, cancelamos o serviço
+    // *(pode ter fechado o cliente ou perdido a ligação)
+    if (cliente_vivo == 0 && s->estado != S_TERMINADO && s->estado != S_CANCELADO)
+    {
+        printf("[CTRL] ALERTA: Cliente %s desapareceu! A cancelar servico %d.\n", s->user, s->id);
 
-    /* printf("[CTRL] servico %d (%s)-> perc = %d%%\n",
-           s->id, s->user, s->perc_concl); */
-
+        // 1. Mandar parar o veículo imediatamente
+        if (s->pid_veiculo != -1)
+        {
+            kill(s->pid_veiculo, SIGINT);
+        }
+        // 2. Marcar como terminado/cancelado para libertar o sistema
+        s->estado = S_CANCELADO;
+    }
     pthread_mutex_unlock(&mux_servicos);
 }
 
@@ -267,8 +284,16 @@ static void processa_mensagem_veiculo(int id_servico, const char *msg)
 // ----------------------------------------------------------------------
 static void spawn_veiculo_para_servico(Servico *s)
 {
-    int p[2];
+    // 1. Garantir que há lugar ANTES de gastar recursos (Pipe/Fork)
+    int id = encontra_slot_livre_veiculo();
+    if (id < 0)
+    {
+        printf("[CTRL] Erro critico: Tentativa de spawn sem slot livre!\n");
+        return;
+    }
 
+    int p[2];
+    // close(p[0]);
     if (pipe(p) == -1)
     {
         perror("[CTRL] pipe");
@@ -295,11 +320,6 @@ static void spawn_veiculo_para_servico(Servico *s)
         close(p[0]);
         close(p[1]);
 
-        const char *m = "[FILHO] antes do execve\n";
-        write(STDERR_FILENO, m, strlen(m));
-
-        /* char *argv[] = {"veiculo", NULL};
-        execve("./veiculo", argv, environ); */
         // Preparar argumentos para o execve
         char str_id[20];
         char str_dist[20];
@@ -317,40 +337,37 @@ static void spawn_veiculo_para_servico(Servico *s)
             NULL       // Sentinela
         };
 
+        // Copia todas as configurações (variáveis de ambiente) que o Pai (Controlador) tem e entrega-as ao Filho (Veículo).
+        // A função execve é a chamada ao sistema "pura" e não faz nada automaticamente em termos de ambiente.
+        // Se usássemos execv, o ambiente seria herdado automaticamente.
+        //* (Página 1, ponto 9)
+        //*"No que respeita à manipulação de recursos do sistema, deve ser dada prioridade
+        //* ao uso de chamadas ao sistema operativo face ao uso de funções biblioteca".
         execve("./veiculo", argv, environ);
 
         // Se chegar aqui, deu erro
         perror("[FILHO] erro no execve");
-
         _exit(1);
     }
 
     // PAI (controlador)
     close(p[1]); // só vamos ler
 
-    int idx = encontra_slot_livre_veiculo();
-    if (idx < 0)
-    {
-        // não há slot livre -> fecha pipe e (idealmente) mata o veiculo
-        close(p[0]);
-        return;
-    }
-
-    veiculos[idx].ativo = 1;
-    veiculos[idx].pid = pid;
-    veiculos[idx].fd_telemetria = p[0];
-    veiculos[idx].id_servico = s->id;
+    veiculos[id].ativo = 1;
+    veiculos[id].pid = pid;
+    veiculos[id].fd_telemetria = p[0];
+    veiculos[id].id_servico = s->id;
 
     s->pid_veiculo = pid;
     s->estado = S_EM_CURSO;
     s->perc_concl = 0;
 
     pthread_t th;
-    pthread_create(&th, NULL, thread_telemetria, (void *)(intptr_t)idx);
+    pthread_create(&th, NULL, thread_telemetria, (void *)(intptr_t)id);
     pthread_detach(th); // não precisamos de dar join mais tarde
 
     printf("[CTRL] veiculo para servico id=%d lançado (idx=%d)\n",
-           s->id, idx);
+           s->id, id);
 }
 
 // ----------------------------------------------------------------------
@@ -630,25 +647,37 @@ static void tratar_pedido_consultar(const Pedido *p)
 // ----------------------------------------------------------------------
 // Função auxiliar para notificar o cliente
 // ----------------------------------------------------------------------
-static void notificar_cliente(const Servico *s, const char *texto)
+static int notificar_cliente(const Servico *s, const char *texto)
 {
     char fifo_cli[128];
     // Reconstrói o nome do FIFO do cliente: ./tmp/taxi_cli_username
     snprintf(fifo_cli, sizeof(fifo_cli), "%s/taxi_cli_%s", FIFO_DIR, s->user);
 
     // Abre em modo NONBLOCK para o controlador não bloquear se o cliente não estiver lá
+    // Se o open falhar com ENXIO, significa que ninguém está a ler do outro lado
     int fd = open(fifo_cli, O_WRONLY | O_NONBLOCK);
-    if (fd != -1)
+    if (fd == -1)
     {
-        Resposta r;
-        memset(&r, 0, sizeof(r));
-        r.ok = 1;
-        r.id_servico = s->id;
-        snprintf(r.msg, sizeof(r.msg), "%s", texto);
-
-        write(fd, &r, sizeof(r));
-        close(fd);
+        // O cliente desligou-se ou não existe!
+        return 0;
     }
+    Resposta r;
+    // Limpa a estrutura para evitar lixo de memória
+    memset(&r, 0, sizeof(r));
+    r.ok = 1;
+    r.id_servico = s->id;
+    snprintf(r.msg, sizeof(r.msg), "%s", texto);
+
+    // Se o write falhar (ex: pipe quebrou a meio), também detetamos
+    if (write(fd, &r, sizeof(r)) == -1)
+    {
+        perror("[CTRL] Erro ao escrever para cliente (pipe quebrado)");
+        close(fd);
+        return 0;
+    }
+
+    close(fd);
+    return 1;
 }
 
 // ----------------------------------------------------------------------
@@ -656,20 +685,20 @@ static void notificar_cliente(const Servico *s, const char *texto)
 // ----------------------------------------------------------------------
 static void *thread_telemetria(void *arg)
 {
-    int idx = (int)(intptr_t)arg; // índice em veiculos[]
-    int fd = veiculos[idx].fd_telemetria;
-    int id_servico = veiculos[idx].id_servico;
+    int id = (int)(intptr_t)arg; // índice em veiculos[]
+    int fd = veiculos[id].fd_telemetria;
+    int id_servico = veiculos[id].id_servico;
 
     char buf[256];
     ssize_t n;
-    // MONITORIZAÇÃO DEDICADA
+    // !MONITORIZAÇÃO DEDICADA
     // Cada veículo tem uma thread exclusiva para ler o seu pipe.
     // Usamos strtok_r para garantir que processamos mensagens completas,
     // mesmo que cheguem "coladas" (ex: PERC 100\nFIM OK\n).
     while ((n = read(fd, buf, sizeof(buf) - 1)) > 0)
     {
         buf[n] = '\0';
-        // === Processar linha a linha ===
+        // !=== Processar linha a linha === //
         // Se o buffer tiver "PERC 100\nFIM OK\n", o strtok parte em dois
         char *saveptr;
         char *token = strtok_r(buf, "\n", &saveptr);
@@ -682,9 +711,9 @@ static void *thread_telemetria(void *arg)
     }
 
     close(fd);
-    veiculos[idx].ativo = 0;
+    veiculos[id].ativo = 0;
 
-    printf("[CTRL] veiculo idx=%d terminou\n", idx);
+    printf("[CTRL] veiculo idx=%d terminou\n", id);
     return NULL;
 }
 
@@ -705,13 +734,22 @@ static void *thread_relogio(void *arg)
         for (int i = 0; i < n_servicos; i++)
         {
             Servico *s = &servicos[i];
-
-            if (s->estado == S_AGENDADO &&
-                s->hora == tempo_simulado)
+            // 1. Verifica se já passou a hora (<=) E se ainda não foi feito (S_AGENDADO)
+            if (s->estado == S_AGENDADO && s->hora <= tempo_simulado)
             {
-                printf("[RELOGIO] hora=%d, lançar servico id=%d\n",
-                       tempo_simulado, s->id);
-                spawn_veiculo_para_servico(s);
+                // 2. Verifica se temos carro para ele
+                if (encontra_slot_livre_veiculo() != -1)
+                {
+                    printf("[RELOGIO] hora=%d (agendada=%d), lançar servico id=%d\n",
+                           tempo_simulado, s->hora, s->id);
+                    // O spawn vai marcar o veículo como ocupado imediatamente
+                    spawn_veiculo_para_servico(s);
+                }
+                else
+                {
+                    // Na próxima volta do while (segundo seguinte), voltamos a tentar!
+                    printf("[RELOGIO] Servico %d em espera (sem veiculos disponiveis)...\n", s->id);
+                }
             }
         }
         pthread_mutex_unlock(&mux_servicos);
@@ -974,10 +1012,44 @@ static void cmd_terminar(void)
     em_encerramento = 1;
     printf("[CTRL] Novos pedidos serao rejeitados.\n");
 
-    // 2. Loop de Espera (Drenagem)
+    // 2. Loop de Espera INTELIGENTE (Deteta clientes mortos)
     while (1)
     {
-        int ativos = conta_servicos_ativos();
+        int ativos = 0;
+
+        pthread_mutex_lock(&mux_servicos);
+        for (int i = 0; i < n_servicos; i++)
+        {
+            Servico *s = &servicos[i];
+            // Verifica apenas se os serviços estão ativos
+            if (s->estado == S_AGENDADO || s->estado == S_EM_CURSO)
+            {
+                // === A MUDANÇA CRÍTICA AQUI ===
+                // Tentamos avisar o cliente. Se a função retornar 0, o cliente morreu.
+                int cliente_vivo = notificar_cliente(s, "O servidor esta a encerrar. Aguarde...");
+
+                if (cliente_vivo)
+                {
+                    // Cliente respondeu, temos de esperar por ele
+                    ativos++;
+                }
+                else
+                {
+                    // Cliente MORREU (Pipe quebrado).
+                    // Não podemos ficar à espera dele. Forçamos o cancelamento!
+                    printf("[CTRL] Cliente do servico %d desapareceu. A forcar cancelamento.\n", s->id);
+
+                    if (s->estado == S_EM_CURSO && s->pid_veiculo != -1)
+                    {
+                        kill(s->pid_veiculo, SIGINT); // Pára o táxi
+                    }
+                    s->estado = S_CANCELADO; // Remove da lista de ativos
+                }
+            }
+        }
+        pthread_mutex_unlock(&mux_servicos);
+
+        // Se não há serviços ativos, saímos do loop
         if (ativos == 0)
         {
             break; // Não há mais táxis na estrada
@@ -987,37 +1059,41 @@ static void cmd_terminar(void)
         sleep(2); // Verifica a cada 2 segundos
     }
 
-    // 3. Notificação final (Opcional) e alteração da flag principal
-    printf("[CTRL] Todos os servicos terminaram. A desligar sistema.\n");
+    // 3. Notificar todos os clientes que o sistema vai encerrar
+    printf("[CTRL] A notificar clientes do encerramento...\n");
 
-    // Isto vai fazer o while(running_ctrl) do main parar
-    running_ctrl = 0;
-
-    /*   // 3. Mandar os Clientes embora (Opcional )
-      pthread_mutex_lock(&mux_servicos);
-      for (int i = 0; i < n_servicos; i++) {
-           // Tenta enviar uma ultima mensagem a dizer "ADEUS"
-           notificar_cliente(&servicos[i], "O sistema encerrou. Ate logo!");
-      }
-      pthread_mutex_unlock(&mux_servicos);     */
-}
-
-// ----------------------------------------------------------------------
-//  Conta serviços ativos (agendados ou em execução)
-// ----------------------------------------------------------------------
-static int conta_servicos_ativos(void)
-{
-    int count = 0;
     pthread_mutex_lock(&mux_servicos);
-    for (int i = 0; i < n_servicos; i++)
+
+    for (int i = 0; i < MAX_USERS; i++)
     {
-        if (servicos[i].estado == S_AGENDADO || servicos[i].estado == S_EM_CURSO)
+        // Só enviamos a quem está ativo na lista de utilizadores
+        if (users[i].ativo)
         {
-            count++;
+            // Usamos o FIFO que guardámos quando ele fez login (HELLO)
+            int fd = open(users[i].fifo_cli, O_WRONLY | O_NONBLOCK);
+            if (fd != -1)
+            {
+                Resposta r;
+                memset(&r, 0, sizeof(r));
+                r.ok = 1;
+                r.id_servico = -1;
+
+                // Esta é a mensagem chave que o cliente vai reconhecer para se desligar
+                snprintf(r.msg, sizeof(r.msg), "SERVIDOR_ENCERRADO");
+
+                write(fd, &r, sizeof(r));
+                close(fd);
+                printf("[CTRL] Notificado user: %s\n", users[i].nome);
+            }
         }
     }
+
     pthread_mutex_unlock(&mux_servicos);
-    return count;
+
+    // 4. Desligar sistema
+    printf("[CTRL] Todos os servicos terminaram. A desligar sistema.\n");
+    // Isto vai fazer o while(running_ctrl) do main parar
+    running_ctrl = 0;
 }
 
 // ----------------------------------------------------------------------

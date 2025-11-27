@@ -9,8 +9,8 @@
 #include <errno.h>
 #include <signal.h>
 
-#include "comunicacao.h"
-#include "cliente_interno.h"
+#include "taxis_protocol.h"
+#include "cliente_ui.h"
 
 #define FIFO_DIR "./tmp"
 #define FIFO_PEDIDOS FIFO_DIR "/taxi_pedidos"
@@ -98,7 +98,9 @@ int main(int argc, char **argv)
     unlink(fifo_resp);
     return 0;
 }
-
+// ----------------------------------------------------------------------
+// Loop principal que lê comandos do utilizador e envia pedidos ao controlador
+// ----------------------------------------------------------------------
 static void loop_comandos(const char *user, const char *fifo_resp_path)
 {
     char linha[256];
@@ -127,7 +129,7 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
         FD_SET(STDIN_FILENO, &readfds); // adicionar stdin ao conjunto
         FD_SET(fd_resp, &readfds);      // adicionar FIFO de resposta ao conjunto
 
-        // O select fica bloqueado aqui até ALGUÉM falar
+        // O select fica bloqueado aqui até haver atividade em stdin ou no FIFO
         int maxfd = (STDIN_FILENO > fd_resp) ? STDIN_FILENO : fd_resp;
 
         // MULTIPLEXAGEM DE I/O (SELECT)
@@ -147,9 +149,22 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
         {
             Resposta r;
             ssize_t n = read(fd_resp, &r, sizeof(r));
+            // Se n=0, significa que o servidor fechou o pipe (EOF) ou crashou
+            if (n == 0)
+            {
+                printf("\n[CRITICO] O servidor desligou-se. A encerrar o cliente.\n");
+                break; // Sai do loop e termina
+            }
+
             if (n == sizeof(r))
             {
-                // Limpar a linha atual (cosmética) e imprimir a mensagem
+                if (strcmp(r.msg, "SERVIDOR_ENCERRADO") == 0)
+                {
+                    printf("\n\n[AVISO DO SISTEMA] O servidor encerrou as operacoes.\n");
+                    printf("Obrigado por utilizar o nosso serviço. Até breve!\n");
+                    break; // Sai do loop e termina o cliente automaticamente
+                }
+                // Mostrar mensagem ao utilizador
                 printf("\n[AVISO] %s\ncomando> ", r.msg);
                 fflush(stdout);
             }
@@ -179,18 +194,9 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
             // Tenta separar: comando + argumentos
             // %31s lê a primeira palavra
             // %223[^\n] lê o resto da linha até ao fim
-            // int n =
             sscanf(linha, "%31s %223[^\n]", comando, args);
 
-            /* if (n < 1)
-                continue; // Linha vazia ou erro
- */
             // Executar comandos
-            // NOTA: Como o FIFO já está aberto aqui (fd_resp),
-            // as funções cmd_* NÃO devem tentar abrir o FIFO de leitura novamente
-            // ou vão bloquear/conflituar.
-            // TEMOS DE AJUSTAR AS FUNÇÕES cmd_agendar E cmd_entrar PARA SÓ ENVIAREM O PEDIDO.
-
             if (strcmp(comando, "agendar") == 0)
             {
                 cmd_agendar(&ctx, args);
@@ -199,18 +205,16 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
             {
                 cmd_entrar(&ctx, args);
             }
-            else if (strcmp(comando, "h") == 0 || strcmp(comando, "help") == 0)
+            else if (strcmp(comando, "ajuda") == 0 || strcmp(comando, "?") == 0 || strcmp(comando, "help") == 0 || strcmp(comando, "h") == 0)
             {
                 cmd_help(&ctx, args);
             }
             else if (strcmp(comando, "cancelar") == 0)
             {
-                // Precisas de declarar cmd_cancelar_pedido no topo!
                 cmd_cancelar_pedido(&ctx, args);
             }
             else if (strcmp(comando, "consultar") == 0)
             {
-                // Precisas de declarar cmd_consultar no topo!
                 cmd_consultar(&ctx, args);
             }
             else if (strcmp(comando, "sair") == 0)
@@ -230,6 +234,9 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
     close(fd_resp); // fechar FIFO de resposta
 }
 
+// ----------------------------------------------------------------------
+// Comandos do cliente
+// ----------------------------------------------------------------------
 static int cmd_help(ContextoCliente *ctx, const char *args)
 {
     (void)ctx;
@@ -242,6 +249,9 @@ static int cmd_help(ContextoCliente *ctx, const char *args)
     return 0;
 }
 
+// ----------------------------------------------------------------------
+// Envia pedido de agendamento
+// ----------------------------------------------------------------------
 static int cmd_agendar(ContextoCliente *ctx, const char *args)
 {
     int hora, dist;
@@ -285,24 +295,13 @@ static int cmd_agendar(ContextoCliente *ctx, const char *args)
     close(fd);
 
     printf("[CLI] Pedido enviado. Aguarde confirmacao...\n");
-    // Aguardar resposta
-    /*     int fd_resp = open(ctx->fifo_resp, O_RDONLY);
-        if (fd_resp != -1)
-        {
-            Resposta r;
-            if (read(fd_resp, &r, sizeof(r)) == sizeof(r))
-            {
-                if (r.ok)
-                    printf("[CLI] Sucesso: %s\n", r.msg);
-                else
-                    printf("[CLI] Erro: %s\n", r.msg);
-            }
-            close(fd_resp);
-        } */
+    // A resposta será lida no loop principal via FIFO de resposta
     return 0;
 }
 
+// ----------------------------------------------------------------------
 // Envia pedido de cancelamento
+// ----------------------------------------------------------------------
 static int cmd_cancelar_pedido(ContextoCliente *ctx, const char *args)
 {
     int id;
@@ -318,8 +317,6 @@ static int cmd_cancelar_pedido(ContextoCliente *ctx, const char *args)
     p.pid_cliente = getpid();
     snprintf(p.user, sizeof(p.user), "%s", ctx->user);
     snprintf(p.fifo_resp, sizeof(p.fifo_resp), "%s", ctx->fifo_resp);
-
-    // Reutilizamos o campo 'id_servico' da Resposta ou usamos 'hora' do Pedido?
 
     // O Pedido não tem campo ID específico, mas podemos usar o campo 'dist' ou 'hora'
     // como "transportadora" do ID, já que não são usados no cancelar.
@@ -340,7 +337,9 @@ static int cmd_cancelar_pedido(ContextoCliente *ctx, const char *args)
     return 0;
 }
 
+// ----------------------------------------------------------------------
 // Envia pedido de consulta
+// ----------------------------------------------------------------------
 static int cmd_consultar(ContextoCliente *ctx, const char *args)
 {
     (void)args; // Sem argumentos
@@ -362,14 +361,20 @@ static int cmd_consultar(ContextoCliente *ctx, const char *args)
     return 0;
 }
 
+// ----------------------------------------------------------------------
+// Envia pedido de sair
+// ----------------------------------------------------------------------
 static int cmd_sair(ContextoCliente *ctx, const char *args)
 {
     (void)ctx;
     (void)args;
     printf("[CLI] A terminar aplicacao...\n");
-    return 0; // Retorna 0 para parar o loop no main (conforme o teu if)
+    return 0; // Retorna 0 para parar o loop no main
 }
 
+// ----------------------------------------------------------------------
+// Envia pedido de entrar no veículo
+// ----------------------------------------------------------------------
 static int cmd_entrar(ContextoCliente *ctx, const char *args)
 {
     (void)args; // Não usamos argumentos para entrar, mas a assinatura pede
@@ -390,21 +395,13 @@ static int cmd_entrar(ContextoCliente *ctx, const char *args)
     }
     write(fd, &p, sizeof(p));
     close(fd);
-
-    /*    // Ler resposta
-       int fd_resp = open(ctx->fifo_resp, O_RDONLY);
-       if (fd_resp != -1)
-       {
-           Resposta r;
-           if (read(fd_resp, &r, sizeof(r)) == sizeof(r))
-           {
-               printf("[CLI] %s\n", r.msg);
-           }
-           close(fd_resp);
-       } */
+    // A resposta será lida no loop principal via FIFO de resposta
     return 0;
 }
 
+// ----------------------------------------------------------------------
+// Configura o diretório FIFO_DIR
+// ----------------------------------------------------------------------
 static void setup_directory(void)
 {
     // Tenta criar o diretório FIFO_DIR
@@ -421,6 +418,9 @@ static void setup_directory(void)
     }
 }
 
+// ----------------------------------------------------------------------
+// Trata sinais como SIGINT e SIGPIPE
+// ----------------------------------------------------------------------
 static void handle_signal(int sig, siginfo_t *info, void *context)
 {
     (void)info;

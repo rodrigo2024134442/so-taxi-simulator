@@ -10,8 +10,7 @@
 volatile sig_atomic_t passageiro_a_bordo = 0;
 volatile sig_atomic_t running = 1;
 
-// #include "modelo.h"
-
+// Função auxiliar para enviar mensagens ao controlador
 static void send_msg(const char *s)
 {
     // escreve a string no stdout

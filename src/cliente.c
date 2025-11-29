@@ -47,14 +47,22 @@ int main(int argc, char **argv)
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = handle_signal;
     sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
     sigaction(SIGPIPE, &sa, NULL);
 
     // Caminho da FIFO deste cliente
     char fifo_resp[128];
     snprintf(fifo_resp, sizeof(fifo_resp), FIFO_DIR "/taxi_cli_%s", user);
 
-    // limpa e cria FIFO de resposta
-    unlink(fifo_resp);
+    // Verificar se o FIFO já existe (outro cliente com o mesmo user?)
+    if (access(fifo_resp, F_OK) == 0)
+    {
+        fprintf(stderr, "[ERRO] O utilizador '%s' já parece estar ligado!\n", user);
+        fprintf(stderr, "Nota: Se o cliente anterior crashou, apaga o ficheiro manualmente:\n");
+        fprintf(stderr, "      rm %s\n", fifo_resp);
+        return 1; // Sai do programa para não estragar a outra sessão
+    }
+    // Criar FIFO de resposta
     if (mkfifo(fifo_resp, 0666) == -1)
     {
         perror("[CLI] mkfifo resposta");
@@ -244,6 +252,9 @@ static int cmd_help(ContextoCliente *ctx, const char *args)
     printf("\n=== Comandos Disponiveis ===\n");
     printf("  agendar <seg> <local> <km>  : Agenda uma nova viagem\n");
     printf("  entrar                      : Entra no taxi quando este chegar\n");
+    printf("  consultar                   : Consulta o estado dos teus servicos\n");
+    printf("  cancelar <id>               : Cancela o servico com o ID indicado (0 para todos)\n");
+    printf("  ajuda (h, ?, help)          : Mostra esta ajuda\n");
     printf("  sair                        : Encerra a aplicacao\n");
     printf("============================\n");
     return 0;
@@ -423,10 +434,43 @@ static void setup_directory(void)
 // ----------------------------------------------------------------------
 static void handle_signal(int sig, siginfo_t *info, void *context)
 {
-    (void)info;
-    (void)context;
-    if (sig == SIGINT || sig == SIGPIPE)
+    (void)context; // Não usado
+    (void)info;    // Não usado
+
+    // Variável estática para contar Ctrl+C (proteção contra saída acidental)
+    static int ctrl_c_count = 0;
+
+    // === CASO 1: INTERRUPÇÃO DE TECLADO (Ctrl+C) ===
+    if (sig == SIGINT)
     {
+        if (ctrl_c_count == 0)
+        {
+            // Primeiro toque: Aviso
+            const char msg[] = "\n[SINAL] Recebi SIGINT. Pressiona novamente para sair.\n";
+            write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+            ctrl_c_count++;
+        }
+        else
+        {
+            // Segundo toque: Sair
+            const char msg[] = "\n[SINAL] A encerrar...\n";
+            write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+            running = 0; // Termina o loop principal
+        }
+    }
+    // === CASO 2: JANELA FECHADA (SIGHUP) ===
+    else if (sig == SIGHUP)
+    {
+        // Se a janela fecha, morremos logo. Não há user para avisar.
+        running = 0;
+    }
+    // === CASO 3: SERVIDOR DESAPARECEU (SIGPIPE) ===
+    else if (sig == SIGPIPE)
+    {
+        // Se tentámos escrever no FIFO e falhou, o servidor morreu.
+        // O cliente não serve para nada sem servidor
+        const char msg[] = "\n[ERRO] Conexão perdida com o Controlador (SIGPIPE).\n";
+        write(STDERR_FILENO, msg, sizeof(msg) - 1);
         running = 0;
     }
 }

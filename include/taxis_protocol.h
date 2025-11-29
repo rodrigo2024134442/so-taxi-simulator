@@ -1,6 +1,6 @@
-// include/protocolo.h
-#ifndef COMUNICACAO_H
-#define COMUNICACAO_H
+// Define o protocolo Cliente ↔ Controlador (Pedido, Resposta, enums).
+#ifndef TAXIS_PROTOCOL_H
+#define TAXIS_PROTOCOL_H
 
 #include <sys/types.h> // para pid_t
 

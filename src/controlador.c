@@ -41,6 +41,7 @@ static void cmd_frota(void);                                            // Proce
 static void cmd_utiliz(void);                                           // Procedimento utiliz
 static void cmd_cancelar(int id_servico);                               // Procedimento cancelar
 static void cmd_terminar(void);                                         // Procedimento de encerramento
+static void cmd_final(void);                                            // Procedimento finalização
 static void handle_signal(int sig, siginfo_t *info, void *context);     // Handler para sinal SIGINT (Ctrl+C)
 
 int main(void)
@@ -78,6 +79,7 @@ int main(void)
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = handle_signal;
+    // SA_RESTART impede que o fgets falhe quando recebes um sinal
     sa.sa_flags = SA_SIGINFO;
     sigaction(SIGINT, &sa, NULL);  // Ctrl+C
     sigaction(SIGHUP, &sa, NULL);  // Hangup do remote
@@ -133,7 +135,21 @@ int main(void)
         fflush(stdout); // Opcional: Prompt
 
         if (!fgets(linha, sizeof(linha), stdin))
+        {
+            // Se o fgets falhou porque foi interrompido por um sinal (EINTR)
+            if (errno == EINTR)
+            {
+                // Se running_ctrl ainda é 1, foi o 1º toque (Aviso).
+                // Limpamos o erro e continuamos o loop para pedir input outra vez.
+                if (running_ctrl)
+                {
+                    clearerr(stdin); // Limpa a flag de erro do stdin
+                    continue;
+                }
+            }
+            // Se chegou aqui, é para sair mesmo (2º toque ou EOF real)
             break;
+        }
         linha[strcspn(linha, "\n")] = '\0';
 
         if (strcmp(linha, "listar") == 0 || strcmp(linha, "l") == 0)
@@ -166,7 +182,7 @@ int main(void)
             printf("| GESTÃO     | MONITORIZA | ESTATISTICA| SISTEMA        |\n");
             printf("+------------+------------+------------+----------------+\n");
             printf("| listar (l) | frota (f)  | km         | cancelar <id>  |\n");
-            printf("| utiliz (u) |            | hora (h)   | help (?)       |\n"); 
+            printf("| utiliz (u) |            | hora (h)   | help (?)       |\n");
             printf("|            |            |            | terminar/sair  |\n");
             printf("+------------+------------+------------+----------------+\n");
         }
@@ -189,8 +205,10 @@ int main(void)
         }
     }
 
-    printf("[CTRL] a terminar\n");
-    unlink(FIFO_PEDIDOS);
+    // === QUANDO SAI DO LOOP ===
+    // Isto executa quer tenha sido 'terminar', quer tenha sido 'Ctrl+C' (2x)
+    cmd_final();
+
     return 0;
 }
 
@@ -640,11 +658,53 @@ static void tratar_pedido_cancelar_user(const Pedido *p)
     int id_alvo = p->dist;
 
     pthread_mutex_lock(&mux_servicos);
+
+    // 1. VALIDAÇÃO DO ID
+    /*    if (id_alvo <= 0 || id_alvo > n_servicos)
+       {
+           // Enviar erro ao cliente
+           int fd = open(p->fifo_resp, O_WRONLY | O_NONBLOCK);
+           if (fd != -1)
+           {
+               Resposta r;
+               r.ok = 0;
+               r.id_servico = id_alvo;
+               snprintf(r.msg, sizeof(r.msg), "Erro: Servico %d nao encontrado.", id_alvo);
+               write(fd, &r, sizeof(r));
+               close(fd);
+           }
+           pthread_mutex_unlock(&mux_servicos);
+           return;
+       } */
+    // 2. CANCELAR TUDO (id_alvo == 0)
     if (id_alvo == 0)
     {
-        // Cancelar TODOS deste user (Opcional do enunciado)
-        // Podes implementar um loop aqui se quiseres
+        printf("[CTRL] Recebido pedido 'CANCELAR TUDO' do user %s\n", p->user);
+        int cancelados = 0;
+
+        for (int i = 0; i < n_servicos; i++)
+        {
+            Servico *s = &servicos[i];
+
+            // Verifica se é do user E se está ativo
+            if (strcmp(s->user, p->user) == 0 &&
+                (s->estado == S_AGENDADO || s->estado == S_EM_CURSO))
+            {
+                // Parar veículo se estiver a andar
+                if (s->estado == S_EM_CURSO && s->pid_veiculo != -1)
+                {
+                    union sigval val;
+                    val.sival_int = 1;
+                    sigqueue(s->pid_veiculo, SIGINT, val);
+                }
+
+                s->estado = S_CANCELADO;
+                cancelados++;
+            }
+        }
+        printf("[CTRL] Total de servicos cancelados para %s: %d\n", p->user, cancelados);
     }
+    // 3. CANCELAR SERVIÇO ESPECÍFICO
     else if (id_alvo > 0 && id_alvo <= n_servicos)
     {
         Servico *s = &servicos[id_alvo - 1];
@@ -679,11 +739,25 @@ static void tratar_pedido_cancelar_user(const Pedido *p)
         }
         else
         {
-            // Tentar cancelar serviço de outro user
-            // Enviamos resposta de erro num canal temporario construído para este pedido
-            // (Ou usamos notificar_cliente se assumirmos que ele é o dono do FIFO)
-            // Simplificação: não notificamos erros de permissão ou logamos no servidor
-            printf("[CTRL] User %s tentou cancelar servico %d que nao lhe pertence.\n", p->user, id_alvo);
+            // === O UTILIZADOR NÃO É O DONO (Tentativa inválida) ===
+            printf("[CTRL] User %s tentou cancelar servico %d (pertence a %s).\n",
+                   p->user, id_alvo, s->user);
+
+            // Enviar mensagem técnica genérica ao atacante/cliente enganado
+            // Usamos p->fifo_resp porque queremos responder a QUEM PEDIU,
+            // e não ao dono do serviço (s->user).
+            int fd = open(p->fifo_resp, O_WRONLY);
+            if (fd != -1)
+            {
+                Resposta r;
+                r.ok = 0;
+                r.id_servico = id_alvo;
+                // Mensagem técnica que não revela detalhes
+                snprintf(r.msg, sizeof(r.msg), "Erro: Servico nao encontrado ou sem permissao.");
+
+                write(fd, &r, sizeof(r));
+                close(fd);
+            }
         }
     }
     pthread_mutex_unlock(&mux_servicos);
@@ -968,11 +1042,40 @@ static void cmd_listar(void)
 {
     pthread_mutex_lock(&mux_servicos);
     printf("=== SERVICOS AGENDADOS ===\n");
+    if (n_servicos == 0)
+    {
+        printf("Lista vazia.\n");
+    }
+
     for (int i = 0; i < n_servicos; i++)
     {
-        printf("ID: %d | User: %s | Estado: %d | Hora: %d | Local: %s\n",
-               servicos[i].id, servicos[i].user, servicos[i].estado,
-               servicos[i].hora, servicos[i].local);
+        // Traduzir o estado (int) para Texto (string)
+        char estado_str[20];
+        switch (servicos[i].estado)
+        {
+        case S_AGENDADO:
+            strcpy(estado_str, "AGENDADO");
+            break;
+        case S_EM_CURSO:
+            strcpy(estado_str, "EM CURSO");
+            break;
+        case S_TERMINADO:
+            strcpy(estado_str, "TERMINADO");
+            break;
+        case S_CANCELADO:
+            strcpy(estado_str, "CANCELADO");
+            break;
+        default:
+            strcpy(estado_str, "???");
+            break;
+        }
+
+        printf("ID: %-3d | User: %-10s | Estado: %-10s | Hora: %-4d | Local: %s\n",
+               servicos[i].id,
+               servicos[i].user,
+               estado_str, // <--- Agora mostra texto!
+               servicos[i].hora,
+               servicos[i].local);
     }
     pthread_mutex_unlock(&mux_servicos);
 }
@@ -1005,7 +1108,7 @@ static void cmd_frota(void)
 static void cmd_utiliz(void)
 {
     pthread_mutex_lock(&mux_servicos);
-    printf("=== UTILIZADORES ONLINE (%d) ===\n", n_users);
+    printf("=== HISTORICO DE UTILIZADORES (%d) ===\n", n_users);
     for (int i = 0; i < MAX_USERS; i++)
     {
         if (users[i].ativo)
@@ -1075,6 +1178,7 @@ static void cmd_terminar(void)
     printf("[CTRL] Novos pedidos serao rejeitados.\n");
 
     // 2. Loop de Espera INTELIGENTE (Deteta clientes mortos)
+
     while (1)
     {
         int ativos = 0;
@@ -1124,28 +1228,66 @@ static void cmd_terminar(void)
         sleep(2); // Verifica a cada 2 segundos
     }
 
-    // 3. Notificar todos os clientes que o sistema vai encerrar
-    printf("[CTRL] A notificar clientes do encerramento...\n");
+    /*  // 3. Notificar todos os clientes que o sistema vai encerrar
+     printf("[CTRL] A notificar clientes do encerramento...\n");
 
+     pthread_mutex_lock(&mux_servicos);
+
+     for (int i = 0; i < MAX_USERS; i++)
+     {
+         // Só enviamos a quem está ativo na lista de utilizadores
+         if (users[i].ativo)
+         {
+             // Usamos o FIFO que guardámos quando ele fez login (HELLO)
+             int fd = open(users[i].fifo_cli, O_RDWR);
+             if (fd != -1)
+             {
+                 Resposta r;
+                 memset(&r, 0, sizeof(r));
+                 r.ok = 1;
+                 r.id_servico = -1;
+
+                 // Esta é a mensagem chave que o cliente vai reconhecer para se desligar
+                 snprintf(r.msg, sizeof(r.msg), "SERVIDOR_ENCERRADO");
+
+                 write(fd, &r, sizeof(r));
+                 close(fd);
+                 printf("[CTRL] Notificado user: %s\n", users[i].nome);
+             }
+         }
+     }
+
+     pthread_mutex_unlock(&mux_servicos);
+
+     printf("[CTRL] Todos os servicos terminaram. A desligar sistema.\n");
+  */
+
+    // 3. Fim da espera -> Mandar o main sair do loop
+    running_ctrl = 0;
+}
+
+// ----------------------------------------------------------------------
+//  Limpeza final de recursos antes de sair
+// ----------------------------------------------------------------------
+static void cmd_final(void)
+{
+    printf("\n[CTRL] === A realizar limpeza final de recursos ===\n");
+
+    // 1. Notificar todos os clientes ligados que vamos fechar
     pthread_mutex_lock(&mux_servicos);
-
     for (int i = 0; i < MAX_USERS; i++)
     {
-        // Só enviamos a quem está ativo na lista de utilizadores
         if (users[i].ativo)
         {
-            // Usamos o FIFO que guardámos quando ele fez login (HELLO)
-            int fd = open(users[i].fifo_cli, O_RDWR);
+            // Tenta enviar a mensagem final
+            int fd = open(users[i].fifo_cli, O_RDWR); // O_RDWR para não bloquear
             if (fd != -1)
             {
                 Resposta r;
                 memset(&r, 0, sizeof(r));
                 r.ok = 1;
                 r.id_servico = -1;
-
-                // Esta é a mensagem chave que o cliente vai reconhecer para se desligar
                 snprintf(r.msg, sizeof(r.msg), "SERVIDOR_ENCERRADO");
-
                 write(fd, &r, sizeof(r));
                 close(fd);
                 printf("[CTRL] Notificado user: %s\n", users[i].nome);
@@ -1153,12 +1295,24 @@ static void cmd_terminar(void)
         }
     }
 
+    // 2. Garantir que nenhum veículo fica vivo (Safety Net)
+    for (int i = 0; i < n_servicos; i++)
+    {
+        if (servicos[i].pid_veiculo != -1 && servicos[i].estado == S_EM_CURSO)
+        {
+            printf("[CTRL] A cancelar veículo residual PID %d\n", servicos[i].pid_veiculo);
+
+            // Usamos sigqueue para manter o padrão, ou kill simples
+            union sigval val;
+            val.sival_int = 1;
+            sigqueue(servicos[i].pid_veiculo, SIGINT, val);
+        }
+    }
     pthread_mutex_unlock(&mux_servicos);
 
-    // 4. Desligar sistema
-    printf("[CTRL] Todos os servicos terminaram. A desligar sistema.\n");
-    // Isto vai fazer o while(running_ctrl) do main parar
-    running_ctrl = 0;
+    // 3. Apagar o FIFO do servidor
+    unlink(FIFO_PEDIDOS);
+    printf("[CTRL] FIFO apagado. Sistema encerrado.\n");
 }
 
 // ----------------------------------------------------------------------

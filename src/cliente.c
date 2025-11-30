@@ -26,9 +26,10 @@ static int cmd_cancelar_pedido(ContextoCliente *ctx, const char *args);
 static int cmd_consultar(ContextoCliente *ctx, const char *args);
 static int cmd_help(ContextoCliente *ctx, const char *args);
 static int cmd_sair(ContextoCliente *ctx, const char *args);
+static void cancelar_tudo_ao_sair(const char *user, const char *fifo_resp_path);
 static void loop_comandos(const char *user, const char *fifo_resp_path);
-static void setup_directory(void);
 static void handle_signal(int sig, siginfo_t *info, void *context);
+static void setup_directory(void);
 
 int main(int argc, char **argv)
 {
@@ -44,6 +45,7 @@ int main(int argc, char **argv)
     // Instalar handlers de SIGINT e SIGPIPE
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
+    // SA_RESTART impede que o fgets falhe quando recebes um sinal
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = handle_signal;
     sigaction(SIGINT, &sa, NULL);
@@ -102,6 +104,10 @@ int main(int argc, char **argv)
     // Entrar no loop de comandos (agendar / sair)
     loop_comandos(user, fifo_resp);
 
+    // Quando o loop termina (seja por 'terminar' ou Ctrl+C), solicitar cancelamento de todos os serviços ativos
+    printf("\n[CLI] A solicitar cancelamento de servicos ativos...\n");
+    cancelar_tudo_ao_sair(user, fifo_resp);
+
     // no fim, limpar FIFO
     unlink(fifo_resp);
     return 0;
@@ -146,8 +152,16 @@ static void loop_comandos(const char *user, const char *fifo_resp_path)
         // e permite mostrar mensagens do servidor em tempo real.
         int atividade = select(maxfd + 1, &readfds, NULL, NULL, NULL);
 
-        if ((atividade < 0) && (errno != EINTR))
+        if (atividade < 0)
         {
+            if (errno == EINTR)
+            {
+                // Foi interrompido por um sinal (ex: Ctrl+C)
+                // Se o handler mudou running para 0, saímos JÁ!
+                if (running)
+                    continue; // Se não, tentamos outra vez
+                break;
+            }
             perror("Erro no select");
             break;
         }
@@ -408,6 +422,32 @@ static int cmd_entrar(ContextoCliente *ctx, const char *args)
     close(fd);
     // A resposta será lida no loop principal via FIFO de resposta
     return 0;
+}
+
+// ----------------------------------------------------------------------
+//  Trata pedido especial ao sair para cancelar todos os serviços deste user
+// ----------------------------------------------------------------------
+static void cancelar_tudo_ao_sair(const char *user, const char *fifo_resp)
+{
+    // Para não bloquear se o servidor estiver morto
+    // abrimos o FIFO em O_RDWR
+    int fd = open(FIFO_PEDIDOS, O_RDWR);
+    if (fd == -1)
+        return; // Controlador já morreu, não vale a pena
+
+    Pedido p;
+    memset(&p, 0, sizeof(p));
+    p.tipo = CMD_CANCELAR;
+    p.pid_cliente = getpid();
+    snprintf(p.user, sizeof(p.user), "%s", user);
+    snprintf(p.fifo_resp, sizeof(p.fifo_resp), "%s", fifo_resp);
+
+    // ID 0 significa "TODOS" na nossa lógica
+    p.dist = 0;
+
+    write(fd, &p, sizeof(p));
+    close(fd);
+    // Não esperamos resposta porque estamos a sair
 }
 
 // ----------------------------------------------------------------------

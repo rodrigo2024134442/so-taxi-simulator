@@ -11,12 +11,16 @@ volatile sig_atomic_t passageiro_a_bordo = 0;
 volatile sig_atomic_t running = 1;
 
 // Função auxiliar para enviar mensagens ao controlador
+// Usa write para evitar problemas em handlers de sinal
 static void send_msg(const char *s)
 {
     // escreve a string no stdout
     write(STDOUT_FILENO, s, strlen(s));
 }
 
+// ----------------------------------------------------------------------
+//  Manipulador de sinal SIGINT/SIGUSR1/SIGTERM
+// ----------------------------------------------------------------------
 void handle_sinais(int sig, siginfo_t *info, void *context)
 {
     (void)context; // Não usamos o contexto do CPU
@@ -59,7 +63,9 @@ void handle_sinais(int sig, siginfo_t *info, void *context)
         running = 0;
     }
 }
-
+// ----------------------------------------------------------------------
+//  Função principal do veículo
+// ----------------------------------------------------------------------
 int main(int argc, char **argv)
 {
 

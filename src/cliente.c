@@ -18,19 +18,23 @@
 #define MAX_DIST_KM 100
 
 // variável global modificada pelo handler de sinais
+// para controlar o loop principal
 volatile sig_atomic_t running = 1;
 
-static int cmd_agendar(ContextoCliente *ctx, const char *args);
-static int cmd_entrar(ContextoCliente *ctx, const char *args);
-static int cmd_cancelar_pedido(ContextoCliente *ctx, const char *args);
-static int cmd_consultar(ContextoCliente *ctx, const char *args);
-static int cmd_help(ContextoCliente *ctx, const char *args);
-static int cmd_sair(ContextoCliente *ctx, const char *args);
-static void cancelar_tudo_ao_sair(const char *user, const char *fifo_resp_path);
-static void loop_comandos(const char *user, const char *fifo_resp_path);
-static void handle_signal(int sig, siginfo_t *info, void *context);
-static void setup_directory(void);
+static int cmd_agendar(ContextoCliente *ctx, const char *args);                  // agendar novo serviço
+static int cmd_entrar(ContextoCliente *ctx, const char *args);                   // entrar no veículo
+static int cmd_cancelar_pedido(ContextoCliente *ctx, const char *args);          // cancelar serviço
+static int cmd_consultar(ContextoCliente *ctx, const char *args);                // consultar serviços
+static int cmd_help(ContextoCliente *ctx, const char *args);                     // mostrar ajuda
+static int cmd_sair(ContextoCliente *ctx, const char *args);                     // sair da aplicação
+static void cancelar_tudo_ao_sair(const char *user, const char *fifo_resp_path); // cancelar todos os serviços ao sair
+static void loop_comandos(const char *user, const char *fifo_resp_path);         // loop principal de comandos
+static void handle_signal(int sig, siginfo_t *info, void *context);              // handler de sinais
+static void setup_directory(void);                                               // cria diretório FIFO_DIR
 
+// ----------------------------------------------------------------------
+//  Função principal do cliente
+// ----------------------------------------------------------------------
 int main(int argc, char **argv)
 {
     setup_directory(); // cria ./tmp se ainda não existir

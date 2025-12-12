@@ -22,8 +22,8 @@ volatile sig_atomic_t running_ctrl = 1; // Controlador em execução
 
 // Prototipos internos
 // Visibilidade no Ligador (Linker).
-// Usamos 'static' para limitar o escopo ao ficheiro atual (controlador.c)
-// Evita conflitos de nomes com outras partes do programa.
+// !Usamos 'static' para limitar o escopo ao ficheiro atual (controlador.c)
+// !Evita conflitos de nomes com outras partes do programa.
 static void processa_mensagem_veiculo(int id_servico, const char *msg); // processa msg veiculo
 static void spawn_veiculo_para_servico(Servico *s);                     // lança veiculo
 static int encontra_slot_livre_veiculo(void);                           // encontra slot livre em veiculos[]
@@ -110,7 +110,6 @@ int main(void)
     // Thread de Atendimento a Clientes (comandos administrativos)
     pthread_create(&th_clientes, NULL, thread_clientes, NULL);
     system("clear");
-    // printf("[CTRL] Sistema pronto. Aceitar comandos de admin (listar (l), frota (f), utiliz (u), km, hora (h), cancelar <id>, terminar)\n");
     printf("\n\033[1;32m[OK] SISTEMA INICIADO E PRONTO.\033[0m\n\n");
 
     printf("\033[1m--- Gestão ---\033[0m\n");
@@ -207,7 +206,30 @@ int main(void)
 
     // === QUANDO SAI DO LOOP ===
     // Isto executa quer tenha sido 'terminar', quer tenha sido 'Ctrl+C' (2x)
+    printf("\n[CTRL] A encerrar sistema...\n");
+    // A. Limpar lógica (Matar veículos, avisar users)
     cmd_final();
+
+    // B. Acordar a thread clientes (que está presa no read)
+    int fd_wake = open(FIFO_PEDIDOS, O_WRONLY | O_NONBLOCK);
+    if (fd_wake != -1)
+    {
+        Pedido p_dummy;
+        memset(&p_dummy, 0, sizeof(p_dummy));
+        p_dummy.tipo = -1;
+        write(fd_wake, &p_dummy, sizeof(p_dummy));
+        close(fd_wake);
+    }
+
+    // C. Esperar que as threads fechem (Join)
+    printf("[CTRL] A aguardar threads principais...\n");
+    pthread_join(th_clientes, NULL);
+    pthread_join(th_clock, NULL); // Opcional: pthread_cancel antes se quiseres ser rápido
+
+    // D. Apagar FIFO
+    unlink(FIFO_PEDIDOS);
+
+    printf("\n\033[1;32m[OK] SISTEMA ENCERRADO COM SUCESSO.\033[0m\n");
 
     return 0;
 }
@@ -339,7 +361,7 @@ static void spawn_veiculo_para_servico(Servico *s)
         return;
     }
 
-    // CRIAR PROCESSO FILHO
+    //! CRIAR PROCESSO FILHO
     // O filho herda os descritores de ficheiro. Usamos dup2 para
     // redirecionar o stdout do filho para o pipe de escrita.
     // Assim, tudo o que o veículo fizer 'printf' vai parar ao pipe de leitura do pai.
@@ -381,7 +403,7 @@ static void spawn_veiculo_para_servico(Servico *s)
         _exit(1);
     }
 
-    // PAI (controlador)
+    // !PAI (controlador)
     close(p[1]); // só vamos ler
 
     veiculos[id].ativo = 1;
@@ -398,16 +420,16 @@ static void spawn_veiculo_para_servico(Servico *s)
     // =================================================================================
     // DECISÃO DE IMPLEMENTAÇÃO: Gestão de Threads (Detach vs Join)
     // ---------------------------------------------------------------------------------
-    // Utilizamos pthread_detach() em vez de pthread_join() por três motivos:
+    // !Utilizamos pthread_detach() em vez de pthread_join() por três motivos:
     //
-    // 1. NÃO BLOQUEANTE: O 'join' bloquearia o Controlador até a viagem terminar
+    // *1. NÃO BLOQUEANTE: O 'join' bloquearia o Controlador até a viagem terminar
     //    (o que pode demorar vários segundos). O Controlador precisa de continuar
     //    livre para atualizar o relógio e atender outros clientes imediatamente.
     //
-    // 2. CONCORRÊNCIA: Permite que a thread de telemetria corra em paralelo
+    // *2. CONCORRÊNCIA: Permite que a thread de telemetria corra em paralelo
     //    ("fire-and-forget") enquanto o processo principal gere outros eventos.
     //
-    // 3. LIMPEZA AUTOMÁTICA: Informa o SO que deve libertar os recursos da thread
+    // *3. LIMPEZA AUTOMÁTICA: Informa o SO que deve libertar os recursos da thread
     //    automaticamente assim que ela terminar, sem intervenção do pai.
     // =================================================================================
     pthread_detach(th); // Não precisamos de fazer pthread_join mais tarde
@@ -861,21 +883,21 @@ static void *thread_veiculos(void *arg)
             token = strtok_r(NULL, "\n", &saveptr);
         }
     }
-
-    close(fd);
-    veiculos[id].ativo = 0;
-
     // === O VEÍCULO DESLIGOU O PIPE (ACABOU) ===
 
-    close(fd);              // Fechar o nosso lado do pipe
-    veiculos[id].ativo = 0; // Libertar o slot
+    close(fd); // Fechar o nosso lado do pipe
 
     // === ELIMINAR O ZOMBIE ===
     // O waitpid recolhe o status do filho e remove-o da tabela de processos.
     // Usamos o PID que guardámos no início da função.
     waitpid(pid_veiculo, NULL, 0);
+    printf("[CTRL] Veiculo (PID %d) recolhido com sucesso.\n", pid_veiculo);
 
-    printf("[CTRL] veiculo idx=%d terminou\n", id);
+    pthread_mutex_lock(&mux_servicos);
+    veiculos[id].ativo = 0; // Libertar o slot
+    pthread_mutex_unlock(&mux_servicos);
+    printf("[CTRL] Veiculo slot %d agora livre.\n", id);
+
     return NULL;
 }
 
@@ -966,6 +988,8 @@ static void *thread_clientes(void *arg)
     {
         Pedido p;
         ssize_t n = read(fd_read, &p, sizeof(p));
+        if (!running_ctrl)
+            break;
         if (n == -1)
         {
             if (errno == EINTR)
@@ -1073,7 +1097,7 @@ static void cmd_listar(void)
         printf("ID: %-3d | User: %-10s | Estado: %-10s | Hora: %-4d | Local: %s\n",
                servicos[i].id,
                servicos[i].user,
-               estado_str, // <--- Agora mostra texto!
+               estado_str, 
                servicos[i].hora,
                servicos[i].local);
     }
@@ -1228,41 +1252,7 @@ static void cmd_terminar(void)
         sleep(2); // Verifica a cada 2 segundos
     }
 
-    /*  // 3. Notificar todos os clientes que o sistema vai encerrar
-     printf("[CTRL] A notificar clientes do encerramento...\n");
-
-     pthread_mutex_lock(&mux_servicos);
-
-     for (int i = 0; i < MAX_USERS; i++)
-     {
-         // Só enviamos a quem está ativo na lista de utilizadores
-         if (users[i].ativo)
-         {
-             // Usamos o FIFO que guardámos quando ele fez login (HELLO)
-             int fd = open(users[i].fifo_cli, O_RDWR);
-             if (fd != -1)
-             {
-                 Resposta r;
-                 memset(&r, 0, sizeof(r));
-                 r.ok = 1;
-                 r.id_servico = -1;
-
-                 // Esta é a mensagem chave que o cliente vai reconhecer para se desligar
-                 snprintf(r.msg, sizeof(r.msg), "SERVIDOR_ENCERRADO");
-
-                 write(fd, &r, sizeof(r));
-                 close(fd);
-                 printf("[CTRL] Notificado user: %s\n", users[i].nome);
-             }
-         }
-     }
-
-     pthread_mutex_unlock(&mux_servicos);
-
-     printf("[CTRL] Todos os servicos terminaram. A desligar sistema.\n");
-  */
-
-    // 3. Fim da espera -> Mandar o main sair do loop
+    // 3. Fim da espera - terminar o loop principal
     running_ctrl = 0;
 }
 
@@ -1295,24 +1285,48 @@ static void cmd_final(void)
         }
     }
 
-    // 2. Garantir que nenhum veículo fica vivo (Safety Net)
-    for (int i = 0; i < n_servicos; i++)
-    {
-        if (servicos[i].pid_veiculo != -1 && servicos[i].estado == S_EM_CURSO)
-        {
-            printf("[CTRL] A cancelar veículo residual PID %d\n", servicos[i].pid_veiculo);
+    // 2. Garantir que nenhum veículo fica vivo
+    int veiculos_para_esperar = 0;
 
-            // Usamos sigqueue para manter o padrão, ou kill simples
-            union sigval val;
-            val.sival_int = 1;
-            sigqueue(servicos[i].pid_veiculo, SIGINT, val);
+    // Iterar sobre a tabela de VEÍCULOS (Físicos), não de Serviços (Lógicos)
+    for (int i = 0; i < max_veiculos_ativos; i++)
+    {
+        // Se este slot da frota está ocupado
+        if (veiculos[i].ativo)
+        {
+            // E se temos um PID válido
+            if (veiculos[i].pid > 0)
+            {
+                printf("[CTRL] A cancelar veículo PID %d (Slot %d)\n", veiculos[i].pid, i);
+                union sigval val;
+                val.sival_int = 1;
+                sigqueue(veiculos[i].pid, SIGINT, val);
+                veiculos_para_esperar++;
+            }
         }
     }
     pthread_mutex_unlock(&mux_servicos);
 
-    // 3. Apagar o FIFO do servidor
-    unlink(FIFO_PEDIDOS);
-    printf("[CTRL] FIFO apagado. Sistema encerrado.\n");
+    // 3. Esperar que os veículos terminem
+    if (veiculos_para_esperar > 0)
+    {
+        printf("[CTRL] A aguardar limpeza de %d veículos...\n", veiculos_para_esperar);
+
+        while (1)
+        {
+            int ainda_ativos = 0;
+            // Verificamos o array de veículos para ver se as threads já puseram ativo=0
+            for (int i = 0; i < max_veiculos_ativos; i++)
+            {
+                if (veiculos[i].ativo)
+                    ainda_ativos++;
+            }
+            if (ainda_ativos == 0)
+                break;      // Vitória! Todos limpos.
+            usleep(100000); // Espera 0.1s antes de verificar outra vez
+        }
+        printf("[CTRL] Todos os veículos recolhidos.\n");
+    }
 }
 
 // ----------------------------------------------------------------------

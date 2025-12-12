@@ -56,7 +56,4 @@ clean:
 	# Apaga os FIFOs temporários (opcional)
 	#rm -f tmp/*
 
-
-
-
-
+	fork/exec.

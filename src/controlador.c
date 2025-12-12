@@ -211,7 +211,7 @@ int main(void)
     cmd_final();
 
     // B. Acordar a thread clientes (que está presa no read)
-    int fd_wake = open(FIFO_PEDIDOS, O_WRONLY | O_NONBLOCK);
+    int fd_wake = open(FIFO_PEDIDOS, O_WRONLY);
     if (fd_wake != -1)
     {
         Pedido p_dummy;

@@ -9,7 +9,8 @@
 // Variável global para controlar o arranque
 volatile sig_atomic_t passageiro_a_bordo = 0;
 volatile sig_atomic_t running = 1;
-
+// !volatile	Otimização / Cache	"Compilador, não sejas esperto. Vai ler à RAM sempre."
+// !sig_atomic_t	Corrupção de Dados	"CPU, escreve isto tudo de uma vez só, sem pausas."
 // Função auxiliar para enviar mensagens ao controlador
 // Usa write para evitar problemas em handlers de sinal
 static void send_msg(const char *s)
